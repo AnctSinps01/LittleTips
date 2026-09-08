@@ -193,7 +193,7 @@ void ShowContextMenu(POINT point) {
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), kMenuStartup, L"开机自启");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuShow, IsWindowVisible(g_window) ? L"隐藏便签" : L"显示便签");
-    AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"退出 \tCtrl+Shift+Q");
     SetForegroundWindow(g_window);
     const int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, g_window, nullptr);
     DestroyMenu(menu);
@@ -233,7 +233,8 @@ LRESULT CALLBACK EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM
     }
     if (!g_editing && message == WM_LBUTTONDOWN) {
         ReleaseCapture();
-        SendMessageW(g_window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        HWND host = GetParent(window);
+        if (host) SendMessageW(host, WM_NCLBUTTONDOWN, HTCAPTION, 0);
         return 0;
     }
     return DefSubclassProc(window, message, wparam, lparam);
@@ -403,6 +404,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     // WM_CREATE runs before CreateWindowExW returns, so initialize operations
     // that need the final HWND only after the handle has been assigned.
     AddTrayIcon();
+    LayoutEditor();
 
     ShowWindow(g_window, showCommand == SW_HIDE ? SW_HIDE : SW_SHOW);
     UpdateWindow(g_window);
@@ -415,6 +417,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         }
         if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'T') {
             SetTopmost(!g_topmost);
+            continue;
+        }
+        if (GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 &&
+            message.message == WM_KEYDOWN && message.wParam == 'Q') {
+            g_exiting = true;
+            DestroyWindow(g_window);
             continue;
         }
         TranslateMessage(&message);
