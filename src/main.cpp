@@ -16,6 +16,7 @@ constexpr wchar_t kAppName[] = L"LittleTips";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kSaveTimer = 1;
 constexpr UINT kTrayId = 1;
+constexpr WORD kTipsIcon = 101;
 constexpr int kMenuEdit = 1001;
 constexpr int kMenuTopmost = 1002;
 constexpr int kMenuStartup = 1003;
@@ -147,7 +148,8 @@ void AddTrayIcon() {
     data.uID = kTrayId;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = kTrayMessage;
-    data.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    data.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kTipsIcon));
+    if (!data.hIcon) data.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
     lstrcpynW(data.szTip, kAppName, ARRAYSIZE(data.szTip));
     Shell_NotifyIconW(NIM_ADD, &data);
     data.uVersion = NOTIFYICON_VERSION_4;
@@ -257,9 +259,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         SendMessageW(g_editor, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(2, 2));
         SendMessageW(g_editor, EM_SETLIMITTEXT, 1024 * 1024, 0);
         SetWindowSubclass(g_editor, EditorSubclass, 1, 0);
-        const int fontSize = -MulDiv(15, GetDpiForWindow(window), 72);
+        const int fontSize = -MulDiv(13, GetDpiForWindow(window), 72);
         g_font = CreateFontW(fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
         SendMessageW(g_editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
         LoadNote();
         SendMessageW(g_editor, EM_SETREADONLY, TRUE, 0);
@@ -273,9 +275,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
             suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
         if (g_font) DeleteObject(g_font);
-        const int fontSize = -MulDiv(15, HIWORD(wparam), 72);
+        const int fontSize = -MulDiv(13, HIWORD(wparam), 72);
         g_font = CreateFontW(fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
         SendMessageW(g_editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
         LayoutEditor();
         return 0;
@@ -380,7 +382,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(kTipsIcon));
+    if (!windowClass.hIcon) windowClass.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    windowClass.hIconSm = windowClass.hIcon;
     windowClass.hbrBackground = g_noteBrush;
     windowClass.lpszClassName = kClassName;
     RegisterClassExW(&windowClass);
