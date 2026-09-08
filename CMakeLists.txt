@@ -8,7 +8,7 @@ add_executable(LittleTips WIN32
 
 target_compile_features(LittleTips PRIVATE cxx_std_20)
 target_compile_definitions(LittleTips PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(LittleTips PRIVATE comctl32 shell32)
+target_link_libraries(LittleTips PRIVATE comctl32 shell32 winmm)
 
 if(MSVC)
     target_compile_options(LittleTips PRIVATE /W4 /permissive- /utf-8 /EHsc)

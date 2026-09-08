@@ -1,9 +1,11 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -15,6 +17,9 @@ constexpr wchar_t kClassName[] = L"LittleTipsWindow";
 constexpr wchar_t kAppName[] = L"LittleTips";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kSaveTimer = 1;
+constexpr UINT_PTR kPhysicsTimer = 2;
+constexpr UINT kPhysicsActiveIntervalMs = 16;
+constexpr UINT kPhysicsIdleIntervalMs = 120;
 constexpr UINT kTrayId = 1;
 constexpr WORD kTipsIcon = 101;
 constexpr int kMenuEdit = 1001;
@@ -22,6 +27,7 @@ constexpr int kMenuTopmost = 1002;
 constexpr int kMenuStartup = 1003;
 constexpr int kMenuShow = 1004;
 constexpr int kMenuExit = 1005;
+constexpr int kMenuAvoidMouse = 1006;
 
 HWND g_window = nullptr;
 HWND g_editor = nullptr;
@@ -29,8 +35,17 @@ HFONT g_font = nullptr;
 HBRUSH g_noteBrush = nullptr;
 bool g_editing = false;
 bool g_topmost = true;
+bool g_avoidMouse = true;
 bool g_exiting = false;
 bool g_loading = false;
+bool g_inSizeMove = false;
+bool g_physicsPositionValid = false;
+double g_physicsX = 0.0;
+double g_physicsY = 0.0;
+double g_velocityX = 0.0;
+double g_velocityY = 0.0;
+LARGE_INTEGER g_lastPhysicsTick{};
+LARGE_INTEGER g_performanceFrequency{};
 UINT g_taskbarCreated = 0;
 std::filesystem::path g_dataDirectory;
 std::filesystem::path g_notePath;
@@ -170,6 +185,41 @@ void SetTopmost(bool topmost) {
     WriteSetting(L"topmost", topmost ? 1 : 0);
 }
 
+void ResetPhysicsMotion() {
+    g_velocityX = 0.0;
+    g_velocityY = 0.0;
+    g_physicsPositionValid = false;
+    QueryPerformanceCounter(&g_lastPhysicsTick);
+}
+
+void UpdatePhysicsTimer() {
+    if (!g_window) return;
+    const bool shouldRun = g_avoidMouse && IsWindowVisible(g_window) && !g_editing && !g_inSizeMove;
+    if (shouldRun) {
+        QueryPerformanceCounter(&g_lastPhysicsTick);
+        SetTimer(g_window, kPhysicsTimer, kPhysicsIdleIntervalMs, nullptr);
+    } else {
+        KillTimer(g_window, kPhysicsTimer);
+        ResetPhysicsMotion();
+    }
+}
+
+void SetAvoidMouse(bool enabled) {
+    g_avoidMouse = enabled;
+    WriteSetting(L"avoidMouse", enabled ? 1 : 0);
+    ResetPhysicsMotion();
+    UpdatePhysicsTimer();
+}
+
+void ToggleVisibility() {
+    if (IsWindowVisible(g_window)) {
+        ShowWindow(g_window, SW_HIDE);
+    } else {
+        ShowWindow(g_window, SW_SHOW);
+        SetForegroundWindow(g_window);
+    }
+}
+
 void SetEditing(bool editing) {
     g_editing = editing;
     SendMessageW(g_editor, EM_SETREADONLY, editing ? FALSE : TRUE, 0);
@@ -183,6 +233,7 @@ void SetEditing(bool editing) {
         SaveNote();
         SetFocus(g_window);
     }
+    UpdatePhysicsTimer();
     InvalidateRect(g_editor, nullptr, TRUE);
 }
 
@@ -190,9 +241,10 @@ void ShowContextMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_editing ? MF_CHECKED : 0), kMenuEdit, L"编辑模式\tCtrl+E");
     AppendMenuW(menu, MF_STRING | (g_topmost ? MF_CHECKED : 0), kMenuTopmost, L"始终置顶\tCtrl+T");
+    AppendMenuW(menu, MF_STRING | (g_avoidMouse ? MF_CHECKED : 0), kMenuAvoidMouse, L"自动躲避鼠标\tCtrl+R");
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), kMenuStartup, L"开机自启");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuShow, IsWindowVisible(g_window) ? L"隐藏便签" : L"显示便签");
+    AppendMenuW(menu, MF_STRING, kMenuShow, IsWindowVisible(g_window) ? L"隐藏便签\tCtrl+W" : L"显示便签\tCtrl+W");
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出 \tCtrl+Shift+Q");
     SetForegroundWindow(g_window);
     const int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, g_window, nullptr);
@@ -200,18 +252,125 @@ void ShowContextMenu(POINT point) {
     switch (command) {
     case kMenuEdit: SetEditing(!g_editing); break;
     case kMenuTopmost: SetTopmost(!g_topmost); break;
+    case kMenuAvoidMouse: SetAvoidMouse(!g_avoidMouse); break;
     case kMenuStartup:
         if (!SetStartupEnabled(!IsStartupEnabled())) MessageBoxW(g_window, L"无法修改开机自启设置。", kAppName, MB_OK | MB_ICONERROR);
         break;
     case kMenuShow:
-        if (IsWindowVisible(g_window)) ShowWindow(g_window, SW_HIDE);
-        else { ShowWindow(g_window, SW_SHOW); SetForegroundWindow(g_window); }
+        ToggleVisibility();
         break;
     case kMenuExit:
         g_exiting = true;
         DestroyWindow(g_window);
         break;
     }
+}
+
+void StepPhysics() {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double elapsed = static_cast<double>(now.QuadPart - g_lastPhysicsTick.QuadPart) /
+        static_cast<double>(g_performanceFrequency.QuadPart);
+    g_lastPhysicsTick = now;
+    const double dt = std::clamp(elapsed, 0.0, 0.033);
+    if (dt <= 0.0) return;
+
+    RECT rect{};
+    GetWindowRect(g_window, &rect);
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    if (!g_physicsPositionValid) {
+        g_physicsX = static_cast<double>(rect.left);
+        g_physicsY = static_cast<double>(rect.top);
+        g_physicsPositionValid = true;
+    }
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const double nearestX = std::clamp(static_cast<double>(cursor.x), g_physicsX, g_physicsX + width);
+    const double nearestY = std::clamp(static_cast<double>(cursor.y), g_physicsY, g_physicsY + height);
+    double awayX = nearestX - cursor.x;
+    double awayY = nearestY - cursor.y;
+    double distance = std::hypot(awayX, awayY);
+    const bool cursorInside = distance < 0.001;
+    if (cursorInside) {
+        awayX = g_physicsX + width * 0.5 - cursor.x;
+        awayY = g_physicsY + height * 0.5 - cursor.y;
+        distance = std::hypot(awayX, awayY);
+        if (distance < 0.001) {
+            awayX = g_velocityX == 0.0 ? 1.0 : g_velocityX;
+            awayY = g_velocityY;
+            distance = std::hypot(awayX, awayY);
+        }
+    }
+
+    const double dpiScale = GetDpiForWindow(g_window) / 96.0;
+    const double influenceRadius = 180.0 * dpiScale;
+    if (cursorInside || distance < influenceRadius) {
+        const double proximity = cursorInside ? 1.0 : 1.0 - distance / influenceRadius;
+        const double acceleration = 4800.0 * dpiScale * proximity * proximity;
+        g_velocityX += awayX / distance * acceleration * dt;
+        g_velocityY += awayY / distance * acceleration * dt;
+    }
+
+    // Once the cursor is outside an edge, keep a resting window attached to it
+    // instead of letting the edge force pull it a few pixels inward.
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    GetMonitorInfoW(MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST), &monitorInfo);
+    const RECT& bounds = monitorInfo.rcWork;
+    if (g_physicsX <= bounds.left && cursor.x < bounds.left && g_velocityX > 0.0) g_velocityX = 0.0;
+    if (g_physicsX + width >= bounds.right && cursor.x > bounds.right && g_velocityX < 0.0) g_velocityX = 0.0;
+    if (g_physicsY <= bounds.top && cursor.y < bounds.top && g_velocityY > 0.0) g_velocityY = 0.0;
+    if (g_physicsY + height >= bounds.bottom && cursor.y > bounds.bottom && g_velocityY < 0.0) g_velocityY = 0.0;
+
+    const double damping = std::exp(-4.1 * dt);
+    g_velocityX *= damping;
+    g_velocityY *= damping;
+    const double maxSpeed = 1050.0 * dpiScale;
+    const double speed = std::hypot(g_velocityX, g_velocityY);
+    if (speed > maxSpeed) {
+        g_velocityX *= maxSpeed / speed;
+        g_velocityY *= maxSpeed / speed;
+    }
+    const bool isIdle = !cursorInside && distance >= influenceRadius && speed < 2.0;
+    if (isIdle) {
+        g_velocityX = 0.0;
+        g_velocityY = 0.0;
+    }
+    SetTimer(g_window, kPhysicsTimer, isIdle ? kPhysicsIdleIntervalMs : kPhysicsActiveIntervalMs, nullptr);
+
+    g_physicsX += g_velocityX * dt;
+    g_physicsY += g_velocityY * dt;
+
+    constexpr double restitution = 0.48;
+    constexpr double wallFriction = 0.62;
+    constexpr double edgeStickSpeed = 35.0;
+    if (g_physicsX < bounds.left) {
+        g_physicsX = static_cast<double>(bounds.left);
+        if (g_velocityX < 0.0) g_velocityX = -g_velocityX * restitution;
+        g_velocityY *= wallFriction;
+        if (std::abs(g_velocityX) < edgeStickSpeed) g_velocityX = 0.0;
+    } else if (g_physicsX + width > bounds.right) {
+        g_physicsX = static_cast<double>(bounds.right - width);
+        if (g_velocityX > 0.0) g_velocityX = -g_velocityX * restitution;
+        g_velocityY *= wallFriction;
+        if (std::abs(g_velocityX) < edgeStickSpeed) g_velocityX = 0.0;
+    }
+    if (g_physicsY < bounds.top) {
+        g_physicsY = static_cast<double>(bounds.top);
+        if (g_velocityY < 0.0) g_velocityY = -g_velocityY * restitution;
+        g_velocityX *= wallFriction;
+        if (std::abs(g_velocityY) < edgeStickSpeed) g_velocityY = 0.0;
+    } else if (g_physicsY + height > bounds.bottom) {
+        g_physicsY = static_cast<double>(bounds.bottom - height);
+        if (g_velocityY > 0.0) g_velocityY = -g_velocityY * restitution;
+        g_velocityX *= wallFriction;
+        if (std::abs(g_velocityY) < edgeStickSpeed) g_velocityY = 0.0;
+    }
+
+    SetWindowPos(g_window, nullptr, static_cast<int>(std::lround(g_physicsX)),
+        static_cast<int>(std::lround(g_physicsY)), 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
 
 void SaveWindowPlacement() {
@@ -225,16 +384,21 @@ void SaveWindowPlacement() {
 }
 
 LRESULT CALLBACK EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR) {
+    if (!g_editing && message == WM_SETCURSOR) {
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
+    }
+    if (!g_editing && (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK)) {
+        ReleaseCapture();
+        if (HWND host = GetParent(window)) {
+            SendMessageW(host, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        return 0;
+    }
     if (message == WM_RBUTTONUP) {
         POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         ClientToScreen(window, &point);
         ShowContextMenu(point);
-        return 0;
-    }
-    if (!g_editing && message == WM_LBUTTONDOWN) {
-        ReleaseCapture();
-        HWND host = GetParent(window);
-        if (host) SendMessageW(host, WM_NCLBUTTONDOWN, HTCAPTION, 0);
         return 0;
     }
     return DefSubclassProc(window, message, wparam, lparam);
@@ -254,6 +418,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         return 0;
     }
     switch (message) {
+    case WM_NCHITTEST: {
+        const LRESULT hit = DefWindowProcW(window, message, wparam, lparam);
+        if (!g_editing && hit == HTCLIENT) return HTCAPTION;
+        return hit;
+    }
+    case WM_NCRBUTTONUP:
+        if (!g_editing && wparam == HTCAPTION) {
+            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            ShowContextMenu(point);
+            return 0;
+        }
+        break;
     case WM_CREATE: {
         g_editor = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
             0, 0, 0, 0, window, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr);
@@ -270,6 +446,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     }
     case WM_SIZE:
         LayoutEditor();
+        return 0;
+    case WM_SHOWWINDOW:
+        UpdatePhysicsTimer();
+        return 0;
+    case WM_ENTERSIZEMOVE:
+        g_inSizeMove = true;
+        UpdatePhysicsTimer();
+        return 0;
+    case WM_EXITSIZEMOVE:
+        g_inSizeMove = false;
+        ResetPhysicsMotion();
+        UpdatePhysicsTimer();
         return 0;
     case WM_DPICHANGED: {
         const RECT* suggested = reinterpret_cast<RECT*>(lparam);
@@ -292,6 +480,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         if (wparam == kSaveTimer) {
             KillTimer(window, kSaveTimer);
             SaveNote();
+        } else if (wparam == kPhysicsTimer) {
+            StepPhysics();
         }
         return 0;
     case WM_CTLCOLOREDIT:
@@ -312,13 +502,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     case WM_KEYDOWN:
         if (GetKeyState(VK_CONTROL) < 0 && wparam == 'E') { SetEditing(!g_editing); return 0; }
         if (GetKeyState(VK_CONTROL) < 0 && wparam == 'T') { SetTopmost(!g_topmost); return 0; }
+        if (GetKeyState(VK_CONTROL) < 0 && wparam == 'R') { SetAvoidMouse(!g_avoidMouse); return 0; }
+        if (GetKeyState(VK_CONTROL) < 0 && wparam == 'W') { ToggleVisibility(); return 0; }
         break;
     case kTrayMessage:
         if (LOWORD(lparam) == WM_CONTEXTMENU) {
             POINT point{};
             GetCursorPos(&point);
             ShowContextMenu(point);
-        } else if (LOWORD(lparam) == WM_LBUTTONDBLCLK) {
+        } else if (LOWORD(lparam) == WM_LBUTTONUP || LOWORD(lparam) == WM_LBUTTONDBLCLK) {
             ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
         }
@@ -332,6 +524,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         break;
     case WM_DESTROY:
         KillTimer(window, kSaveTimer);
+        KillTimer(window, kPhysicsTimer);
         SaveNote();
         SaveWindowPlacement();
         RemoveTrayIcon();
@@ -374,6 +567,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    QueryPerformanceFrequency(&g_performanceFrequency);
+    timeBeginPeriod(1);
     InitializePaths();
     InitCommonControls();
     g_noteBrush = CreateSolidBrush(RGB(255, 246, 178));
@@ -392,11 +587,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     const RECT rect = InitialWindowRect();
     g_topmost = ReadSetting(L"topmost", 1) != 0;
+    g_avoidMouse = ReadSetting(L"avoidMouse", 1) != 0;
     g_window = CreateWindowExW(g_topmost ? WS_EX_TOPMOST : 0, kClassName, kAppName,
         WS_POPUP | WS_THICKFRAME, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, instance, nullptr);
     if (!g_window) {
         DeleteObject(g_noteBrush);
+        timeEndPeriod(1);
         CloseHandle(mutex);
         return 1;
     }
@@ -408,6 +605,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     ShowWindow(g_window, showCommand == SW_HIDE ? SW_HIDE : SW_SHOW);
     UpdateWindow(g_window);
+    UpdatePhysicsTimer();
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -417,6 +615,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         }
         if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'T') {
             SetTopmost(!g_topmost);
+            continue;
+        }
+        if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'R') {
+            SetAvoidMouse(!g_avoidMouse);
+            continue;
+        }
+        if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'W') {
+            ToggleVisibility();
             continue;
         }
         if (GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 &&
@@ -430,6 +636,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     DeleteObject(g_noteBrush);
+    timeEndPeriod(1);
     CloseHandle(mutex);
     return static_cast<int>(message.wParam);
 }
