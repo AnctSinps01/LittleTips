@@ -287,27 +287,23 @@ void StepPhysics() {
 
     POINT cursor{};
     GetCursorPos(&cursor);
-    const double nearestX = std::clamp(static_cast<double>(cursor.x), g_physicsX, g_physicsX + width);
-    const double nearestY = std::clamp(static_cast<double>(cursor.y), g_physicsY, g_physicsY + height);
-    double awayX = nearestX - cursor.x;
-    double awayY = nearestY - cursor.y;
+    const double centerX = g_physicsX + width * 0.5;
+    const double centerY = g_physicsY + height * 0.5;
+    double awayX = centerX - cursor.x;
+    double awayY = centerY - cursor.y;
     double distance = std::hypot(awayX, awayY);
-    const bool cursorInside = distance < 0.001;
-    if (cursorInside) {
-        awayX = g_physicsX + width * 0.5 - cursor.x;
-        awayY = g_physicsY + height * 0.5 - cursor.y;
+    if (distance < 0.001) {
+        awayX = g_velocityX == 0.0 ? 1.0 : g_velocityX;
+        awayY = g_velocityY;
         distance = std::hypot(awayX, awayY);
-        if (distance < 0.001) {
-            awayX = g_velocityX == 0.0 ? 1.0 : g_velocityX;
-            awayY = g_velocityY;
-            distance = std::hypot(awayX, awayY);
-        }
     }
 
     const double dpiScale = GetDpiForWindow(g_window) / 96.0;
     const double influenceRadius = 180.0 * dpiScale;
-    if (cursorInside || distance < influenceRadius) {
-        const double proximity = cursorInside ? 1.0 : 1.0 - distance / influenceRadius;
+    const double falloffStart = std::hypot(static_cast<double>(width), static_cast<double>(height)) * 0.5;
+    const bool inRange = distance < falloffStart + influenceRadius;
+    if (inRange) {
+        const double proximity = std::clamp((falloffStart + influenceRadius - distance) / influenceRadius, 0.0, 1.0);
         const double acceleration = 4800.0 * dpiScale * proximity * proximity;
         g_velocityX += awayX / distance * acceleration * dt;
         g_velocityY += awayY / distance * acceleration * dt;
@@ -332,7 +328,7 @@ void StepPhysics() {
         g_velocityX *= maxSpeed / speed;
         g_velocityY *= maxSpeed / speed;
     }
-    const bool isIdle = !cursorInside && distance >= influenceRadius && speed < 2.0;
+    const bool isIdle = !inRange && speed < 2.0;
     if (isIdle) {
         g_velocityX = 0.0;
         g_velocityY = 0.0;
@@ -588,7 +584,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     const RECT rect = InitialWindowRect();
     g_topmost = ReadSetting(L"topmost", 1) != 0;
     g_avoidMouse = ReadSetting(L"avoidMouse", 1) != 0;
-    g_window = CreateWindowExW(g_topmost ? WS_EX_TOPMOST : 0, kClassName, kAppName,
+    const DWORD extendedStyle = WS_EX_TOOLWINDOW | (g_topmost ? WS_EX_TOPMOST : 0);
+    g_window = CreateWindowExW(extendedStyle, kClassName, kAppName,
         WS_POPUP | WS_THICKFRAME, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, instance, nullptr);
     if (!g_window) {
