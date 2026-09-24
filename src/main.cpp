@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <mmsystem.h>
 #include <shellapi.h>
 
@@ -18,6 +19,8 @@ constexpr wchar_t kAppName[] = L"LittleTips";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kSaveTimer = 1;
 constexpr UINT_PTR kPhysicsTimer = 2;
+constexpr UINT_PTR kPlacementSaveTimer = 3;
+constexpr UINT kPlacementSaveDelayMs = 500;
 constexpr UINT kPhysicsActiveIntervalMs = 16;
 constexpr UINT kPhysicsIdleIntervalMs = 120;
 constexpr UINT kTrayId = 1;
@@ -28,6 +31,12 @@ constexpr int kMenuStartup = 1003;
 constexpr int kMenuShow = 1004;
 constexpr int kMenuExit = 1005;
 constexpr int kMenuAvoidMouse = 1006;
+// DWMWINDOWATTRIBUTE values newer than some SDK headers; keep the app buildable
+// on older toolchains and on systems that simply reject them.
+constexpr DWORD kDwmCornerPreferenceAttribute = 33;
+constexpr DWORD kDwmBorderColorAttribute = 34;
+constexpr int kDwmCornerRound = 2;
+constexpr DWORD kDwmBorderColorNone = 0xFFFFFFFE;
 
 HWND g_window = nullptr;
 HWND g_editor = nullptr;
@@ -50,6 +59,9 @@ UINT g_taskbarCreated = 0;
 std::filesystem::path g_dataDirectory;
 std::filesystem::path g_notePath;
 std::filesystem::path g_configPath;
+
+void SaveWindowPlacement();
+void ResizeWindowToFitText(HWND window);
 
 std::wstring GetExecutablePath() {
     std::wstring path(260, L'\0');
@@ -213,6 +225,7 @@ void SetAvoidMouse(bool enabled) {
 
 void ToggleVisibility() {
     if (IsWindowVisible(g_window)) {
+        SaveWindowPlacement();
         ShowWindow(g_window, SW_HIDE);
     } else {
         ShowWindow(g_window, SW_SHOW);
@@ -408,16 +421,105 @@ void LayoutEditor() {
         std::max(0, static_cast<int>(client.bottom) - margin * 2), TRUE);
 }
 
+void ResizeWindowToFitText(HWND window) {
+    if (!window || !g_editor) return;
+
+    const int textLength = GetWindowTextLengthW(g_editor);
+    std::wstring text(static_cast<size_t>(textLength) + 1, L'\0');
+    GetWindowTextW(g_editor, text.data(), textLength + 1);
+    text.resize(textLength);
+
+    HDC dc = GetDC(g_editor);
+    if (!dc) return;
+    HFONT editorFont = reinterpret_cast<HFONT>(SendMessageW(g_editor, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = editorFont ? SelectObject(dc, editorFont) : nullptr;
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+
+    int widestLine = 0;
+    int lineCount = 1;
+    size_t lineStart = 0;
+    for (size_t index = 0; index <= text.size(); ++index) {
+        const bool atEnd = index == text.size();
+        const bool atBreak = !atEnd && (text[index] == L'\r' || text[index] == L'\n');
+        if (!atEnd && !atBreak) continue;
+
+        const int lineLength = static_cast<int>(index - lineStart);
+        if (lineLength > 0) {
+            const DWORD extent = GetTabbedTextExtentW(dc, text.data() + lineStart, lineLength, 0, nullptr);
+            widestLine = std::max(widestLine, static_cast<int>(LOWORD(extent)));
+        }
+        if (atEnd) break;
+        if (text[index] == L'\r' && index + 1 < text.size() && text[index + 1] == L'\n') ++index;
+        lineStart = index + 1;
+        ++lineCount;
+    }
+
+    if (oldFont) SelectObject(dc, oldFont);
+    ReleaseDC(g_editor, dc);
+
+    const UINT dpi = GetDpiForWindow(window);
+    const int outerMargin = MulDiv(12, dpi, 96);
+    const DWORD editMargins = static_cast<DWORD>(SendMessageW(g_editor, EM_GETMARGINS, 0, 0));
+    const int horizontalEditMargins = LOWORD(editMargins) + HIWORD(editMargins);
+    const int caretRoom = std::max(2, static_cast<int>(metrics.tmAveCharWidth));
+    const int minimumWidth = MulDiv(96, dpi, 96);
+    int desiredWidth = std::max(minimumWidth,
+        widestLine + caretRoom + horizontalEditMargins + outerMargin * 2);
+    int desiredHeight = lineCount * static_cast<int>(metrics.tmHeight) + outerMargin * 2;
+
+    RECT current{};
+    GetWindowRect(window, &current);
+    HMONITOR monitor = MonitorFromRect(&current, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    GetMonitorInfoW(monitor, &monitorInfo);
+    const RECT& workArea = monitorInfo.rcWork;
+    desiredWidth = std::min(desiredWidth, static_cast<int>(workArea.right - workArea.left));
+    desiredHeight = std::min(desiredHeight, static_cast<int>(workArea.bottom - workArea.top));
+    const int x = std::clamp(current.left, workArea.left, workArea.right - desiredWidth);
+    const int y = std::clamp(current.top, workArea.top, workArea.bottom - desiredHeight);
+
+    if (current.right - current.left == desiredWidth && current.bottom - current.top == desiredHeight &&
+        current.left == x && current.top == y) return;
+    ResetPhysicsMotion();
+    SetWindowPos(window, nullptr, x, y, desiredWidth, desiredHeight,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+void ApplyCustomFrame(HWND window) {
+    const int cornerPreference = kDwmCornerRound;
+    DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(kDwmCornerPreferenceAttribute),
+        &cornerPreference, sizeof(cornerPreference));
+    const DWORD borderColor = kDwmBorderColorNone;
+    DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(kDwmBorderColorAttribute),
+        &borderColor, sizeof(borderColor));
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == g_taskbarCreated) {
         AddTrayIcon();
         return 0;
     }
     switch (message) {
+    case WM_NCCALCSIZE:
+        // Drop the standard non-client frame entirely so the class brush paints
+        // pale yellow edge to edge and the visible window matches GetWindowRect.
+        if (wparam) return 0;
+        break;
+    case WM_NCACTIVATE:
+        // Re-assert the custom frame; activation changes otherwise make the
+        // default handler paint the classic frame inward over the client area.
+        ApplyCustomFrame(window);
+        return TRUE;
+    case WM_NCPAINT:
+        return 0;
     case WM_NCHITTEST: {
-        const LRESULT hit = DefWindowProcW(window, message, wparam, lparam);
-        if (!g_editing && hit == HTCLIENT) return HTCAPTION;
-        return hit;
+        const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        RECT rect{};
+        GetWindowRect(window, &rect);
+        if (PtInRect(&rect, point)) return g_editing ? HTCLIENT : HTCAPTION;
+        break;
     }
     case WM_NCRBUTTONUP:
         if (!g_editing && wparam == HTCAPTION) {
@@ -438,6 +540,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         SendMessageW(g_editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
         LoadNote();
         SendMessageW(g_editor, EM_SETREADONLY, TRUE, 0);
+        ApplyCustomFrame(window);
         return 0;
     }
     case WM_SIZE:
@@ -454,7 +557,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         g_inSizeMove = false;
         ResetPhysicsMotion();
         UpdatePhysicsTimer();
+        KillTimer(window, kPlacementSaveTimer);
+        SaveWindowPlacement();
         return 0;
+    case WM_WINDOWPOSCHANGED: {
+        const WINDOWPOS* position = reinterpret_cast<WINDOWPOS*>(lparam);
+        if (!(position->flags & SWP_NOMOVE) || !(position->flags & SWP_NOSIZE)) {
+            SetTimer(window, kPlacementSaveTimer, kPlacementSaveDelayMs, nullptr);
+        }
+        break;
+    }
     case WM_DPICHANGED: {
         const RECT* suggested = reinterpret_cast<RECT*>(lparam);
         SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
@@ -465,11 +577,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
         SendMessageW(g_editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
         LayoutEditor();
+        ResizeWindowToFitText(window);
         return 0;
     }
     case WM_COMMAND:
         if (reinterpret_cast<HWND>(lparam) == g_editor && HIWORD(wparam) == EN_CHANGE && !g_loading) {
             SetTimer(window, kSaveTimer, 700, nullptr);
+            ResizeWindowToFitText(window);
         }
         return 0;
     case WM_TIMER:
@@ -478,6 +592,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             SaveNote();
         } else if (wparam == kPhysicsTimer) {
             StepPhysics();
+        } else if (wparam == kPlacementSaveTimer) {
+            KillTimer(window, kPlacementSaveTimer);
+            SaveWindowPlacement();
         }
         return 0;
     case WM_CTLCOLOREDIT:
@@ -514,6 +631,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     case WM_CLOSE:
         if (!g_exiting) {
             SetEditing(false);
+            KillTimer(window, kPlacementSaveTimer);
+            SaveWindowPlacement();
             ShowWindow(window, SW_HIDE);
             return 0;
         }
@@ -521,6 +640,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     case WM_DESTROY:
         KillTimer(window, kSaveTimer);
         KillTimer(window, kPhysicsTimer);
+        KillTimer(window, kPlacementSaveTimer);
         SaveNote();
         SaveWindowPlacement();
         RemoveTrayIcon();
@@ -586,7 +706,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     g_avoidMouse = ReadSetting(L"avoidMouse", 1) != 0;
     const DWORD extendedStyle = WS_EX_TOOLWINDOW | (g_topmost ? WS_EX_TOPMOST : 0);
     g_window = CreateWindowExW(extendedStyle, kClassName, kAppName,
-        WS_POPUP | WS_THICKFRAME, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+        WS_POPUP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, instance, nullptr);
     if (!g_window) {
         DeleteObject(g_noteBrush);
@@ -599,6 +719,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     // that need the final HWND only after the handle has been assigned.
     AddTrayIcon();
     LayoutEditor();
+    ResizeWindowToFitText(g_window);
 
     ShowWindow(g_window, showCommand == SW_HIDE ? SW_HIDE : SW_SHOW);
     UpdateWindow(g_window);
