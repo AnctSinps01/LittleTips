@@ -2,6 +2,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <gdiplus.h>
 #include <mmsystem.h>
 #include <shellapi.h>
 
@@ -16,6 +17,12 @@ namespace {
 
 constexpr wchar_t kClassName[] = L"LittleTipsWindow";
 constexpr wchar_t kAppName[] = L"LittleTips";
+constexpr COLORREF kNoteColor = RGB(255, 246, 178);
+constexpr COLORREF kBorderColor = RGB(198, 178, 94);
+constexpr COLORREF kTextColor = RGB(45, 43, 35);
+constexpr float kBorderWidth = 4.0f;
+constexpr int kBorderSteps = 12;
+constexpr float kNoteCornerRadius = 8.0f;
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kSaveTimer = 1;
 constexpr UINT_PTR kPhysicsTimer = 2;
@@ -26,26 +33,21 @@ constexpr UINT kPhysicsIdleIntervalMs = 120;
 constexpr UINT kTrayId = 1;
 constexpr WORD kTipsIcon = 101;
 constexpr int kMenuEdit = 1001;
-constexpr int kMenuTopmost = 1002;
 constexpr int kMenuStartup = 1003;
-constexpr int kMenuShow = 1004;
 constexpr int kMenuExit = 1005;
-constexpr int kMenuAvoidMouse = 1006;
 // DWMWINDOWATTRIBUTE values newer than some SDK headers; keep the app buildable
 // on older toolchains and on systems that simply reject them.
 constexpr DWORD kDwmCornerPreferenceAttribute = 33;
 constexpr DWORD kDwmBorderColorAttribute = 34;
 constexpr int kDwmCornerRound = 2;
-constexpr DWORD kDwmBorderColorNone = 0xFFFFFFFE;
 
 HWND g_window = nullptr;
 HWND g_editor = nullptr;
 HFONT g_font = nullptr;
 HBRUSH g_noteBrush = nullptr;
+ULONG_PTR g_gdiplusToken = 0;
+bool g_gdiplusReady = false;
 bool g_editing = false;
-bool g_topmost = true;
-bool g_avoidMouse = true;
-bool g_exiting = false;
 bool g_loading = false;
 bool g_inSizeMove = false;
 bool g_physicsPositionValid = false;
@@ -121,7 +123,7 @@ void SaveNote() {
 void LoadNote() {
     std::ifstream file(g_notePath, std::ios::binary);
     if (!file) {
-        SetWindowTextW(g_editor, L"双击托盘图标显示便签。\r\n右键打开菜单，切换编辑模式。");
+        SetWindowTextW(g_editor, L"点击便签任意位置可拖动。\r\n右键打开菜单，Ctrl+E 进入编辑。");
         return;
     }
     const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -191,12 +193,6 @@ void RemoveTrayIcon() {
     Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
-void SetTopmost(bool topmost) {
-    g_topmost = topmost;
-    SetWindowPos(g_window, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    WriteSetting(L"topmost", topmost ? 1 : 0);
-}
-
 void ResetPhysicsMotion() {
     g_velocityX = 0.0;
     g_velocityY = 0.0;
@@ -206,30 +202,13 @@ void ResetPhysicsMotion() {
 
 void UpdatePhysicsTimer() {
     if (!g_window) return;
-    const bool shouldRun = g_avoidMouse && IsWindowVisible(g_window) && !g_editing && !g_inSizeMove;
+    const bool shouldRun = IsWindowVisible(g_window) && !g_editing && !g_inSizeMove;
     if (shouldRun) {
         QueryPerformanceCounter(&g_lastPhysicsTick);
         SetTimer(g_window, kPhysicsTimer, kPhysicsIdleIntervalMs, nullptr);
     } else {
         KillTimer(g_window, kPhysicsTimer);
         ResetPhysicsMotion();
-    }
-}
-
-void SetAvoidMouse(bool enabled) {
-    g_avoidMouse = enabled;
-    WriteSetting(L"avoidMouse", enabled ? 1 : 0);
-    ResetPhysicsMotion();
-    UpdatePhysicsTimer();
-}
-
-void ToggleVisibility() {
-    if (IsWindowVisible(g_window)) {
-        SaveWindowPlacement();
-        ShowWindow(g_window, SW_HIDE);
-    } else {
-        ShowWindow(g_window, SW_SHOW);
-        SetForegroundWindow(g_window);
     }
 }
 
@@ -253,27 +232,18 @@ void SetEditing(bool editing) {
 void ShowContextMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_editing ? MF_CHECKED : 0), kMenuEdit, L"编辑模式\tCtrl+E");
-    AppendMenuW(menu, MF_STRING | (g_topmost ? MF_CHECKED : 0), kMenuTopmost, L"始终置顶\tCtrl+T");
-    AppendMenuW(menu, MF_STRING | (g_avoidMouse ? MF_CHECKED : 0), kMenuAvoidMouse, L"自动躲避鼠标\tCtrl+R");
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), kMenuStartup, L"开机自启");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuShow, IsWindowVisible(g_window) ? L"隐藏便签\tCtrl+W" : L"显示便签\tCtrl+W");
-    AppendMenuW(menu, MF_STRING, kMenuExit, L"退出 \tCtrl+Shift+Q");
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
     SetForegroundWindow(g_window);
     const int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, g_window, nullptr);
     DestroyMenu(menu);
     switch (command) {
     case kMenuEdit: SetEditing(!g_editing); break;
-    case kMenuTopmost: SetTopmost(!g_topmost); break;
-    case kMenuAvoidMouse: SetAvoidMouse(!g_avoidMouse); break;
     case kMenuStartup:
         if (!SetStartupEnabled(!IsStartupEnabled())) MessageBoxW(g_window, L"无法修改开机自启设置。", kAppName, MB_OK | MB_ICONERROR);
         break;
-    case kMenuShow:
-        ToggleVisibility();
-        break;
     case kMenuExit:
-        g_exiting = true;
         DestroyWindow(g_window);
         break;
     }
@@ -491,9 +461,64 @@ void ApplyCustomFrame(HWND window) {
     const int cornerPreference = kDwmCornerRound;
     DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(kDwmCornerPreferenceAttribute),
         &cornerPreference, sizeof(cornerPreference));
-    const DWORD borderColor = kDwmBorderColorNone;
+    // The border is painted below as well; this hairline keeps the outermost
+    // pixels solid where the antialiased stroke fades out.
+    const COLORREF borderColor = kBorderColor;
     DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(kDwmBorderColorAttribute),
         &borderColor, sizeof(borderColor));
+}
+
+COLORREF BlendColor(COLORREF from, COLORREF to, float amount) {
+    const auto mix = [amount](BYTE a, BYTE b) {
+        return static_cast<BYTE>(std::lround(a + (b - a) * amount));
+    };
+    return RGB(mix(GetRValue(from), GetRValue(to)), mix(GetGValue(from), GetGValue(to)),
+        mix(GetBValue(from), GetBValue(to)));
+}
+
+void StrokeRoundedBand(Gdiplus::Graphics& graphics, float width, float height, float scale, COLORREF color,
+    float centerLine, float thickness) {
+    // The window corners are rounded by DWM, so each step is centred on its own
+    // centre line and its outer half follows the same rounded clip.
+    const float radius = std::max(1.0f, kNoteCornerRadius * scale - centerLine);
+    const float inset = centerLine;
+    const float diameter = radius * 2.0f;
+    const Gdiplus::RectF bounds(inset, inset, width - inset * 2.0f, height - inset * 2.0f);
+
+    Gdiplus::GraphicsPath path;
+    path.AddArc(bounds.X, bounds.Y, diameter, diameter, 180.0f, 90.0f);
+    path.AddArc(bounds.GetRight() - diameter, bounds.Y, diameter, diameter, 270.0f, 90.0f);
+    path.AddArc(bounds.GetRight() - diameter, bounds.GetBottom() - diameter, diameter, diameter, 0.0f, 90.0f);
+    path.AddArc(bounds.X, bounds.GetBottom() - diameter, diameter, diameter, 90.0f, 90.0f);
+    path.CloseFigure();
+
+    Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)), thickness);
+    graphics.DrawPath(&pen, &path);
+}
+
+void PaintNoteBorder(HWND window, HDC dc) {
+    if (!g_gdiplusReady) return;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return;
+    const float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0f;
+    const float width = static_cast<float>(client.right - client.left);
+    const float height = static_cast<float>(client.bottom - client.top);
+    const float thickness = kBorderWidth * scale;
+    if (width <= thickness * 2.0f || height <= thickness * 2.0f) return;
+
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+    // A short monotonic ramp from a darker edge tone to the note colour: the
+    // edge gives a crisp outline, the fade reads as the rounded edge curving
+    // into shadow. Thin concentric strokes are antialiased into a smooth ramp.
+    const float step = thickness / kBorderSteps;
+    for (int index = 0; index < kBorderSteps; ++index) {
+        const float progress = (index + 0.5f) / static_cast<float>(kBorderSteps);
+        StrokeRoundedBand(graphics, width, height, scale, BlendColor(kBorderColor, kNoteColor, progress),
+            (index + 0.5f) * step, step);
+    }
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -514,6 +539,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         return TRUE;
     case WM_NCPAINT:
         return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        PaintNoteBorder(window, dc);
+        EndPaint(window, &paint);
+        return 0;
+    }
     case WM_NCHITTEST: {
         const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         RECT rect{};
@@ -600,8 +632,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wparam);
-        SetTextColor(dc, RGB(45, 43, 35));
-        SetBkColor(dc, RGB(255, 246, 178));
+        SetTextColor(dc, kTextColor);
+        SetBkColor(dc, kNoteColor);
         return reinterpret_cast<LRESULT>(g_noteBrush);
     }
     case WM_CONTEXTMENU: {
@@ -614,9 +646,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         return 0;
     case WM_KEYDOWN:
         if (GetKeyState(VK_CONTROL) < 0 && wparam == 'E') { SetEditing(!g_editing); return 0; }
-        if (GetKeyState(VK_CONTROL) < 0 && wparam == 'T') { SetTopmost(!g_topmost); return 0; }
-        if (GetKeyState(VK_CONTROL) < 0 && wparam == 'R') { SetAvoidMouse(!g_avoidMouse); return 0; }
-        if (GetKeyState(VK_CONTROL) < 0 && wparam == 'W') { ToggleVisibility(); return 0; }
         break;
     case kTrayMessage:
         if (LOWORD(lparam) == WM_CONTEXTMENU) {
@@ -629,14 +658,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         }
         return 0;
     case WM_CLOSE:
-        if (!g_exiting) {
-            SetEditing(false);
-            KillTimer(window, kPlacementSaveTimer);
-            SaveWindowPlacement();
-            ShowWindow(window, SW_HIDE);
-            return 0;
-        }
-        break;
+        DestroyWindow(window);
+        return 0;
     case WM_DESTROY:
         KillTimer(window, kSaveTimer);
         KillTimer(window, kPhysicsTimer);
@@ -687,7 +710,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     timeBeginPeriod(1);
     InitializePaths();
     InitCommonControls();
-    g_noteBrush = CreateSolidBrush(RGB(255, 246, 178));
+    const Gdiplus::GdiplusStartupInput gdiplusInput;
+    g_gdiplusReady = Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok;
+    g_noteBrush = CreateSolidBrush(kNoteColor);
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSEXW windowClass{sizeof(windowClass)};
@@ -702,14 +727,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     RegisterClassExW(&windowClass);
 
     const RECT rect = InitialWindowRect();
-    g_topmost = ReadSetting(L"topmost", 1) != 0;
-    g_avoidMouse = ReadSetting(L"avoidMouse", 1) != 0;
-    const DWORD extendedStyle = WS_EX_TOOLWINDOW | (g_topmost ? WS_EX_TOPMOST : 0);
+    const DWORD extendedStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
     g_window = CreateWindowExW(extendedStyle, kClassName, kAppName,
         WS_POPUP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, instance, nullptr);
     if (!g_window) {
         DeleteObject(g_noteBrush);
+        if (g_gdiplusReady) Gdiplus::GdiplusShutdown(g_gdiplusToken);
         timeEndPeriod(1);
         CloseHandle(mutex);
         return 1;
@@ -731,29 +755,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             SetEditing(!g_editing);
             continue;
         }
-        if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'T') {
-            SetTopmost(!g_topmost);
-            continue;
-        }
-        if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'R') {
-            SetAvoidMouse(!g_avoidMouse);
-            continue;
-        }
-        if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'W') {
-            ToggleVisibility();
-            continue;
-        }
-        if (GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 &&
-            message.message == WM_KEYDOWN && message.wParam == 'Q') {
-            g_exiting = true;
-            DestroyWindow(g_window);
-            continue;
-        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
 
     DeleteObject(g_noteBrush);
+    if (g_gdiplusReady) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     timeEndPeriod(1);
     CloseHandle(mutex);
     return static_cast<int>(message.wParam);
