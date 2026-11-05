@@ -521,6 +521,25 @@ void PaintNoteBorder(HWND window, HDC dc) {
     }
 }
 
+// Resizing leaves the old border behind: the newly exposed frame strips get
+// erased by the class brush but are never repainted. Invalidate just the ring
+// between the window edge and the editor so only the frame is redrawn.
+void InvalidateNoteFrame(HWND window) {
+    RECT client{};
+    if (!GetClientRect(window, &client)) return;
+    if (client.right <= 0 || client.bottom <= 0) return;
+    const int margin = MulDiv(12, static_cast<int>(GetDpiForWindow(window)), 96);
+    HRGN outer = CreateRectRgn(0, 0, client.right, client.bottom);
+    HRGN inner = CreateRectRgn(margin, margin, std::max(margin, static_cast<int>(client.right) - margin),
+        std::max(margin, static_cast<int>(client.bottom) - margin));
+    if (outer && inner) {
+        CombineRgn(outer, outer, inner, RGN_DIFF);
+        InvalidateRgn(window, outer, TRUE);
+    }
+    if (outer) DeleteObject(outer);
+    if (inner) DeleteObject(inner);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == g_taskbarCreated) {
         AddTrayIcon();
@@ -577,6 +596,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     }
     case WM_SIZE:
         LayoutEditor();
+        InvalidateNoteFrame(window);
         return 0;
     case WM_SHOWWINDOW:
         UpdatePhysicsTimer();
