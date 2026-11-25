@@ -1,6 +1,6 @@
 # LittleTips 项目状态
 
-更新时间：2026-11-25 12:08 (+08:00)
+更新时间：2026-11-25 13:05 (+08:00)
 
 ## 路径
 
@@ -36,14 +36,21 @@
 - MSVC 那一侧在修 `/MANIFEST:NO` 之前是**构建失败**的（CVT1100 资源重复 + LNK1123），
   即 README 里写的 MSVC 路径此前在本仓库走不通 —— 现在通了
 
-### 运行态
+### 运行态（2026-11-25 13:03 起）
 
-- 实例 PID 18840，2026-11-25 10:43 启动，路径 `D:\self_designed_exes\LittleTips.exe`
-- 该 exe 与"清理前"的 `build-mingw\LittleTips.exe` SHA256 完全相同
-  （`B5E32D15…D2267145`）→ 部署的就是本仓库的构建产物
+- 已部署新构建：`D:\self_designed_exes\LittleTips.exe` = `build-mingw\LittleTips.exe`，
+  SHA256 `93EE5321…57F0F4A8`，1,523,712 B
+- 选 MinGW 版部署的原因：它只依赖系统 DLL + UCRT；MSVC 版还要
+  `MSVCP140.dll` / `VCRUNTIME140.dll` / `VCRUNTIME140_1.dll`（VC 运行库）
+- 运行实例 PID 2176，13:03:40 启动，窗口类 `LittleTipsWindow` 可见（hwnd 459554）
+- 换 exe 前必须先关旧实例（exe 被运行中的镜像锁住，覆盖会报
+  "正由另一进程使用"）。用 `WM_CLOSE` 优雅关闭即可，会走 `WM_DESTROY` 保存，
+  `note.txt` 时间戳随之更新（13:03:36），内容未丢
+- 单实例修复实测生效：13:03:47 重复启动写入了 `already running` 行并以 exit 0 退出
 - 自启：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\LittleTips`
   = `"D:\self_designed_exes\LittleTips.exe"`
-- `startup.log` 只有 `launch` 行、无 `already running` 行 → 单实例互斥体修复在线上生效
+- 替换前的旧部署（`B5E32D15…D2267145`，即清理前构建）备份在
+  `%TEMP%\lt-deployed-old.exe`
 - `settings.ini` 里 `topmost=1` / `avoidMouse=1` 是提交 `38ea407` 遗留的孤儿键，
   当前源码既不读也不写（`WriteSetting` 只写 x/y/width/height），
   `WritePrivateProfileStringW` 会原样保留它们
@@ -78,14 +85,15 @@
 
 ## 未决问题
 
-1. **部署的仍是旧构建**：`D:\self_designed_exes\LittleTips.exe` 还是清理前的产物
-   （SHA256 `B5E32D15…`），新构建没拷过去；用户 2026-11-25 说验证等会再说
+1. **交互功能未人工验证**：新构建已跑起来，启动、窗口显示、单实例都已实测；
+   但菜单（编辑模式/开机自启/退出）、`Ctrl+E`、躲避鼠标这几个需要人手操作，
+   2026-11-25 用户说"验证等会再说"，尚未确认
 2. `settings.ini` 的 `topmost` / `avoidMouse` 孤儿键未删（属用户数据文件，不是代码）
 3. `SaveWindowPlacement` 仍写 `width` / `height`，但窗口启动后立刻被
    `ResizeWindowToFitText` 覆盖，这两个值只在"创建瞬间"起作用 —— 是否保留待定
 4. `InitCommonControls()` 是没有 common control 时机的遗留 no-op 调用，未删
-5. 部署靠手工拷贝 exe 到 `D:\self_designed_exes\`，无脚本
-6. **本轮未做运行时验证**：单实例互斥体会让新构建直接复用正在运行的旧进程，
-   要看菜单/编辑/躲避鼠标是否正常，得先退出旧进程再启动新构建
+5. 部署靠手工拷贝 exe 到 `D:\self_designed_exes\`，无脚本；换 exe 前必须先关旧实例
+6. MSVC 版构建能用但没部署（比 MinGW 版小很多，208,896 B vs 1,523,712 B，
+   代价是依赖 VC 运行库）—— 要不要改用 MSVC 版待定
 7. MSVC 构建日志里有一条 `'pwsh.exe' 不是内部或外部命令`（cmd 报错），
    不影响构建结果（exit 0、产物正确），来源未查明
