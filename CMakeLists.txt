@@ -12,7 +12,9 @@ target_link_libraries(LittleTips PRIVATE comctl32 dwmapi gdiplus shell32 winmm)
 
 if(MSVC)
     target_compile_options(LittleTips PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    target_link_options(LittleTips PRIVATE /MANIFEST:EMBED)
+    # src/resources.rc already embeds app.manifest as resource 1; letting the
+    # linker embed its own copy makes CVTRES fail with a duplicate manifest.
+    target_link_options(LittleTips PRIVATE /MANIFEST:NO)
 else()
     target_compile_options(LittleTips PRIVATE -Wall -Wextra -Wpedantic -Os)
     # Use the system runtime DLLs; this keeps the app's resident image small.

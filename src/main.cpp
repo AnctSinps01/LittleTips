@@ -2,6 +2,9 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+// MSVC's gdiplus.h needs the COM basics (STDMETHOD, IStream) that
+// WIN32_LEAN_AND_MEAN removes from windows.h; objbase.h puts them back.
+#include <objbase.h>
 #include <gdiplus.h>
 #include <mmsystem.h>
 #include <shellapi.h>
