@@ -170,6 +170,25 @@ bool SetStartupEnabled(bool enabled) {
     return status == ERROR_SUCCESS;
 }
 
+// One line per launch; the first thing to look at when autostart misbehaves.
+void LogStartup(const wchar_t* event) {
+    if (g_dataDirectory.empty()) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[32]{};
+    wsprintfW(stamp, L"%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth, now.wDay, now.wHour,
+        now.wMinute, now.wSecond);
+    const std::wstring line = std::wstring(stamp) + L"  " + event + L"  " + GetExecutablePath() + L"\r\n";
+
+    const std::filesystem::path path = g_dataDirectory / L"startup.log";
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    const bool rotate = !error && size > 64 * 1024;
+    std::ofstream file(path, std::ios::binary | (rotate ? std::ios::trunc : std::ios::app));
+    const std::string utf8 = WideToUtf8(line);
+    file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+}
+
 void AddTrayIcon() {
     NOTIFYICONDATAW data{};
     data.cbSize = sizeof(data);
@@ -715,8 +734,15 @@ RECT InitialWindowRect() {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    InitializePaths();
+    LogStartup(L"launch");
+    // CreateMutexW only sets the last error when the mutex already exists, so
+    // clear it first or a stale error would make every launch look like a copy.
+    SetLastError(0);
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\LittleTips.SingleInstance");
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+    const DWORD mutexState = GetLastError();
+    if (!mutex || mutexState == ERROR_ALREADY_EXISTS) {
+        LogStartup(L"already running");
         if (HWND existing = FindWindowW(kClassName, nullptr)) {
             ShowWindow(existing, SW_SHOW);
             SetForegroundWindow(existing);
@@ -728,7 +754,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     QueryPerformanceFrequency(&g_performanceFrequency);
     timeBeginPeriod(1);
-    InitializePaths();
     InitCommonControls();
     const Gdiplus::GdiplusStartupInput gdiplusInput;
     g_gdiplusReady = Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok;
