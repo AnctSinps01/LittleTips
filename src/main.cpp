@@ -14,7 +14,6 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <vector>
 
 namespace {
 
@@ -36,8 +35,8 @@ constexpr UINT kPhysicsIdleIntervalMs = 120;
 constexpr UINT kTrayId = 1;
 constexpr WORD kTipsIcon = 101;
 constexpr int kMenuEdit = 1001;
-constexpr int kMenuStartup = 1003;
-constexpr int kMenuExit = 1005;
+constexpr int kMenuStartup = 1002;
+constexpr int kMenuExit = 1003;
 // DWMWINDOWATTRIBUTE values newer than some SDK headers; keep the app buildable
 // on older toolchains and on systems that simply reject them.
 constexpr DWORD kDwmCornerPreferenceAttribute = 33;
@@ -316,7 +315,8 @@ void StepPhysics() {
 
     // Once the cursor is outside an edge, keep a resting window attached to it
     // instead of letting the edge force pull it a few pixels inward.
-    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
     GetMonitorInfoW(MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST), &monitorInfo);
     const RECT& bounds = monitorInfo.rcWork;
     if (g_physicsX <= bounds.left && cursor.x < bounds.left && g_velocityX > 0.0) g_velocityX = 0.0;
@@ -684,11 +684,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         ShowContextMenu(point);
         return 0;
     }
-    case WM_HOTKEY:
-        return 0;
-    case WM_KEYDOWN:
-        if (GetKeyState(VK_CONTROL) < 0 && wparam == 'E') { SetEditing(!g_editing); return 0; }
-        break;
     case kTrayMessage:
         if (LOWORD(lparam) == WM_CONTEXTMENU) {
             POINT point{};
@@ -725,7 +720,8 @@ RECT InitialWindowRect() {
     rect.right = rect.left + width;
     rect.bottom = rect.top + height;
     HMONITOR monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO info{sizeof(info)};
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
     GetMonitorInfoW(monitor, &info);
     rect.left = std::clamp(rect.left, info.rcWork.left, std::max(info.rcWork.left, info.rcWork.right - width));
     rect.top = std::clamp(rect.top, info.rcWork.top, std::max(info.rcWork.top, info.rcWork.bottom - height));
@@ -763,7 +759,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     g_noteBrush = CreateSolidBrush(kNoteColor);
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
-    WNDCLASSEXW windowClass{sizeof(windowClass)};
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -799,6 +796,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        // The one keyboard shortcut, handled before dispatch: the loop sees the
+        // key-down whether the note or its edit control has focus, so Ctrl+E
+        // needs no RegisterHotKey and no window-level WM_KEYDOWN branch.
         if (GetKeyState(VK_CONTROL) < 0 && message.message == WM_KEYDOWN && message.wParam == 'E') {
             SetEditing(!g_editing);
             continue;
